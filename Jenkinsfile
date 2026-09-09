@@ -38,10 +38,59 @@ pipeline {
         '''
       }
     }
+
+    stage('Export image for scanning') {
+      steps {
+        sh 'docker save $IMAGE:$TAG -o image.tar'
+      }
+    }
+
+    stage('SCA + image scan') {
+      steps {
+        sh '''
+          docker run --rm \
+            -v "$WORKSPACE":/work \
+            -v trivy-cache:/root/.cache/trivy \
+            aquasec/trivy image \
+              --input /work/image.tar \
+              --scanners vuln \
+              --format template --template "@contrib/html.tpl" \
+              --output /work/trivy-report.html \
+              --exit-code 0
+
+          docker run --rm -v "$WORKSPACE":/work alpine \
+            chown -R "$(id -u):$(id -g)" /work
+        '''
+      }
+    }
+
+    stage('Gate: base image CRITICALs') {
+      steps {
+        sh '''
+          docker run --rm \
+            -v trivy-cache:/root/.cache/trivy \
+            -v "$WORKSPACE":/work \
+            aquasec/trivy image \
+              --input /work/image.tar \
+              --scanners vuln \
+              --pkg-types os \
+              --severity CRITICAL \
+              --ignore-unfixed \
+              --exit-code 1
+        '''
+      }
+    }
   }
 
   post {
     always {
+      archiveArtifacts artifacts: 'trivy-report.html', allowEmptyArchive: true
+      publishHTML(target: [
+        reportDir: '.', reportFiles: 'trivy-report.html',
+        reportName: 'Trivy Scan', keepAll: true,
+        alwaysLinkToLastBuild: true, allowMissing: true
+      ])
+      sh 'rm -f image.tar || true'
       sh 'docker image prune -f || true'
     }
   }
