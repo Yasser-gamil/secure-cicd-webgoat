@@ -91,7 +91,7 @@ pipeline {
         alwaysLinkToLastBuild: true, allowMissing: true
       ])
       sh 'rm -f image.tar || true'
-      sh 'docker image prune -f || true'
+      sh 'docker rmi $IMAGE:$TAG || true'
     }
   }
 }
