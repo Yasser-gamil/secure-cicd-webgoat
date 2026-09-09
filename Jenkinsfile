@@ -19,6 +19,37 @@ pipeline {
       }
     }
 
+    stage('SAST: Semgrep') {
+      steps {
+        sh '''
+          docker run --rm \
+            -v "$WORKSPACE":/src \
+            -w /src \
+            semgrep/semgrep:latest \
+            semgrep scan \
+              --config=p/java \
+              --config=p/secrets \
+              --sarif \
+              --output=/src/semgrep.sarif \
+              --metrics=off \
+              --no-error \
+              --exclude=target \
+              src/
+
+          docker run --rm -v "$WORKSPACE":/work alpine \
+            chown -R "$(id -u):$(id -g)" /work
+        '''
+      }
+      post {
+        always {
+          recordIssues(
+            tools: [sarif(pattern: 'semgrep.sarif', name: 'Semgrep SAST')],
+            skipPublishingChecks: true
+          )
+        }
+      }
+    }
+
     stage('Build image') {
       steps {
         sh 'docker build -f Dockerfile.secure -t $IMAGE:$TAG -t $IMAGE:secure .'
@@ -142,7 +173,7 @@ pipeline {
   post {
     always {
       sh 'docker rm -f webgoat-target || true'
-      archiveArtifacts artifacts: 'trivy-report.html,zap-report.html,zap-report.json', allowEmptyArchive: true
+      archiveArtifacts artifacts: 'trivy-report.html,zap-report.html,zap-report.json,semgrep.sarif', allowEmptyArchive: true
       publishHTML(target: [
         reportDir: '.', reportFiles: 'trivy-report.html',
         reportName: 'Trivy Scan', keepAll: true,
