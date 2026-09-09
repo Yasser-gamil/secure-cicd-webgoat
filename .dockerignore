@@ -4,3 +4,8 @@ docs
 *.md
 Jenkinsfile
 docs
+*.sarif
+trivy-report.html
+zap-report.html
+zap-report.json
+image.tar
