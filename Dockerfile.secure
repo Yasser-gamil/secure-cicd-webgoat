@@ -1,0 +1,46 @@
+# ---------- build stage ----------
+FROM docker.io/eclipse-temurin:25-jdk-noble AS build
+
+WORKDIR /src
+COPY . .
+
+# skipTests: WebGoat's integration tests boot the app in forked JVMs.
+# 2-3 GB peak and most of the build time. We are demonstrating a
+# pipeline, not WebGoat's test suite.
+RUN ./mvnw -B -DskipTests package \
+    && cp target/webgoat-*.jar /webgoat.jar
+
+# ---------- runtime stage ----------
+# JDK, not JRE: WebGoat compiles Java at runtime for several lessons.
+FROM docker.io/eclipse-temurin:25-jdk-noble
+
+LABEL name="WebGoat (hardened build)"
+
+# Fixed numeric UID so the runtime identity does not depend on an
+# /etc/passwd lookup and satisfies runAsNonRoot policies.
+RUN useradd -u 10001 -ms /bin/bash webgoat
+
+COPY --from=build --chown=10001:10001 /webgoat.jar /home/webgoat/webgoat.jar
+
+USER 10001
+WORKDIR /home/webgoat
+
+ENV TZ=Africa/Cairo
+
+EXPOSE 8080
+
+# --add-opens flags are load-bearing on Java 25 (module access for
+# reflective lesson code) - carried over from upstream verbatim.
+ENTRYPOINT [ "java", \
+   "-Duser.home=/home/webgoat", \
+   "-Dfile.encoding=UTF-8", \
+   "--add-opens", "java.base/java.lang=ALL-UNNAMED", \
+   "--add-opens", "java.base/java.util=ALL-UNNAMED", \
+   "--add-opens", "java.base/java.lang.reflect=ALL-UNNAMED", \
+   "--add-opens", "java.base/java.text=ALL-UNNAMED", \
+   "--add-opens", "java.desktop/java.beans=ALL-UNNAMED", \
+   "--add-opens", "java.desktop/java.awt.font=ALL-UNNAMED", \
+   "--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED", \
+   "--add-opens", "java.base/java.io=ALL-UNNAMED", \
+   "-Drunning.in.docker=true", \
+   "-jar", "webgoat.jar", "--server.address", "0.0.0.0" ]
