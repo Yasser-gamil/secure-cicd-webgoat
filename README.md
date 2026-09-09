@@ -1,167 +1,147 @@
-# WebGoat: A deliberately insecure Web Application
+# secure-cicd-webgoat
 
-[![Build](https://github.com/WebGoat/WebGoat/actions/workflows/build.yml/badge.svg?branch=develop)](https://github.com/WebGoat/WebGoat/actions/workflows/build.yml)
-[![java-jdk](https://img.shields.io/badge/java%20jdk-25-green.svg)](https://jdk.java.net/)
-[![OWASP Labs](https://img.shields.io/badge/OWASP-Lab%20project-f7b73c.svg)](https://owasp.org/projects/)
-[![GitHub release](https://img.shields.io/github/release/WebGoat/WebGoat.svg)](https://github.com/WebGoat/WebGoat/releases/latest)
-[![Gitter](https://badges.gitter.im/OWASPWebGoat/community.svg)](https://gitter.im/OWASPWebGoat/community?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
-[![Discussions](https://img.shields.io/github/discussions/WebGoat/WebGoat)](https://github.com/WebGoat/WebGoat/discussions)
-[![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-%23FE5196?logo=conventionalcommits&logoColor=white)](https://conventionalcommits.org)
+Secure CI/CD pipeline for OWASP WebGoat — Jenkins on Docker-in-Docker with linting, SAST, SCA, and DAST stages, plus pipeline and container hardening.
 
-# Introduction
+On the target application: OWASP WebGoat is a deliberately insecure application, maintained by OWASP as a security training tool. It is used here as the target-under-test: it guarantees the scanners have real findings to report, which is what makes the pipeline's output meaningful rather than a wall of green checkmarks. Dependency alerts on this repository are expected and intentional. WebGoat is never deployed anywhere reachable from an untrusted network.
 
-WebGoat is a deliberately insecure web application maintained by [OWASP](http://www.owasp.org/) designed to teach web
-application security lessons.
+What this repository is
 
-This program is a demonstration of common server-side application flaws. The
-exercises are intended to be used by people to learn about application security and
-penetration testing techniques.
+A CI/CD pipeline built to demonstrate that security controls belong inside the delivery process rather than bolted on after it. The application is incidental; the pipeline and the reasoning behind its architecture are the deliverable.
 
-**WARNING 1:** *While running this program your machine will be extremely
-vulnerable to attack. You should disconnect from the Internet while using
-this program.*  WebGoat's default configuration binds to localhost to minimize
-the exposure.
+Every architectural decision below is documented with its trade-off. Where a more secure option was rejected, the reason is stated.
 
-**WARNING 2:** *This program is for educational purposes only. If you attempt
-these techniques without authorization, you are very likely to get caught. If
-you are caught engaging in unauthorized hacking, most companies will fire you.
-Claiming that you were doing security research will not work as that is the
-first thing that all hackers claim.*
+Architecture
+Ubuntu VM
+Docker network: jenkins
+mutual TLSDOCKER_HOST=tcp://docker:2376
+builds & runs
+builds & runs
+scans
+Jenkins controllerdocker CLI only:8080 published
+docker:dind sidecar--privileged:2376 TLS, NOT published
+WebGoat containerUID 10001, non-root
+Scanner containersTrivy · ZAP · SAST
 
-![WebGoat](docs/images/webgoat.png)
+Only port 8080 is exposed to the host. The Docker daemon's API is reachable exclusively over the internal network, authenticated with client certificates.
 
-# Installation instructions:
+Key design decisions
+Docker-in-Docker, not a mounted host socket
 
-For more details check [the Contribution guide](/CONTRIBUTING.md)
+The common approach to giving Jenkins container-build capability is to bind-mount the host's /var/run/docker.sock into the Jenkins container. It is faster to set up, and it is also equivalent to granting unrestricted root on the host: any pipeline step can mount / or launch a privileged container in the host's namespace.
 
-## 1. Run using Docker
+This pipeline instead runs a docker:dind sidecar with its own daemon, which Jenkins reaches over an internal Docker network. The host's Docker socket is never exposed.
 
-Already have a browser and ZAP and/or Burp installed on your machine in this case you can run the WebGoat image directly using Docker.
+Trade-off, stated plainly: the sidecar itself requires --privileged. This relocates the privilege boundary rather than eliminating it. The gain is that a compromised pipeline step reaches a disposable daemon instead of the host. This is also Jenkins' own officially documented Docker installation pattern.
 
-Every release is also published on [DockerHub](https://hub.docker.com/r/webgoat/webgoat).
+The daemon's API port is not published
 
-```shell
-docker run -it -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 webgoat/webgoat
-```
+An earlier iteration included --publish 2376:2376 on the sidecar. It was removed.
 
-For some lessons you need the container run in the same timezone. For this you can set the TZ environment variable.
-E.g.
+Jenkins resolves the daemon by network alias (tcp://docker:2376); container-to-container traffic on a user-defined bridge requires no published port. The flag was functionally inert while binding the API of a privileged, root-equivalent daemon to the VM's LAN address. TLS client-certificate authentication mitigated it but did not justify it — publishing a privileged control plane to the local network directly contradicts the reason DinD was chosen.
 
-```shell
-docker run -it -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 -e TZ=America/Boise webgoat/webgoat
-```
+TLS on the daemon channel, not plaintext 2375
 
-If you want to use OWASP ZAP or another proxy, you can no longer use 127.0.0.1 or localhost. but
-you can use custom host entries. For example:
+DOCKER_TLS_CERTDIR=/certs causes the sidecar to generate a CA and require client certificates. The control channel is mutually authenticated rather than anonymous. Jenkins mounts the certificate volume read-only.
 
-```shell
-127.0.0.1 www.webgoat.local www.webwolf.local
-```
+Documented residual risk: shared trust domain
 
-Then you can run the container with:
+The Jenkins home volume is mounted into the dind sidecar, because the daemon — not Jenkins — resolves the paths used when pipeline steps bind-mount $WORKSPACE into scanner containers. Removing the mount breaks every scanner stage.
 
-```shell
-docker run -it -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 -e WEBGOAT_HOST=www.webgoat.local -e WEBWOLF_HOST=www.webwolf.local -e TZ=America/Boise webgoat/webgoat
-```
+The consequence is stated rather than hidden: Jenkins' credential store resides within the trust domain of a privileged daemon that pipeline steps can drive. This is acceptable here because nothing untrusted executes — single repository, single maintainer, no builds from forked pull requests.
 
-Then visit http://www.webgoat.local:8080/WebGoat/ and http://www.webwolf.local:9090/WebWolf/
+Production alternative: ephemeral per-build agents, or rootless image builds via Kaniko or Buildah, removing the privileged daemon entirely.
 
-## 2. Run using Docker with complete Linux Desktop
+Minimal Jenkins controller
 
-Instead of installing tools locally we have a complete Docker image based on running a desktop in your browser. This way you only have to run a Docker image which will give you the best user experience.
+The Docker CLI is copied from the docker:cli image via a multi-stage build rather than installed with apt-get install docker.io. The apt package would pull containerd and runc into the controller — a complete container runtime that is never used. The controller receives a Docker client and nothing else.
 
-```shell
-docker run -p 127.0.0.1:3000:3000 webgoat/webgoat-desktop
-```
+Container hardening
 
-## 3. Standalone
+Built as Dockerfile.secure, alongside the upstream Dockerfile so the two can be compared directly.
 
-Download the latest WebGoat release from [https://github.com/WebGoat/WebGoat/releases](https://github.com/WebGoat/WebGoat/releases)
+Control	Implementation
+Non-root runtime	Fixed numeric UID 10001; verifiable with docker run --rm --entrypoint id webgoat:secure
+No build toolchain in final image	Multi-stage build; Maven and the source tree stay in the discarded build stage
+Reproducible build	Maven runs inside the image build, requiring no host toolchain — unlike upstream, which expects a pre-built JAR on the host
+Image vulnerability scanning	Trivy stage in pipeline (planned)
+Read-only root filesystem	Under evaluation — see below
+Two findings worth recording
 
-```shell
-export TZ=Europe/Amsterdam # or your timezone
-java -Dfile.encoding=UTF-8 -jar webgoat-2023.8.jar
-```
+A slim JRE base image was evaluated and rejected. Several WebGoat lessons compile Java at runtime, so a JRE-only image breaks them — and breaks them silently, in a way that presents as a broken application rather than a missing compiler. The full JDK is retained deliberately. Reducing image size at the cost of application correctness is not a security improvement.
 
-Click the link in the log to start WebGoat.
+The upstream HEALTHCHECK was removed. It invokes curl, which means shipping an HTTP client inside the runtime image — a convenient exfiltration primitive for very little benefit. The pipeline must wait for application readiness before DAST regardless, so the readiness probe lives in the Jenkinsfile where it is explicit and auditable, rather than in image metadata.
 
-### 3.1 Running on a different port
+WebGoat writes lesson state beneath -Duser.home=/home/webgoat. A blanket read-only root filesystem therefore breaks provisioning at startup; the intended approach is a read-only root with a writable tmpfs or volume mounted at that path specifically.
 
-If for some reason you want to run WebGoat on a different port, you can do so by adding the following parameter:
+Pipeline stages
+Stage	Tool	Status
+Lint	Dockerfile + Groovy linting	Planned
+SAST	Static analysis of WebGoat source	Planned
+SCA	Trivy	Planned
+Container scan	Trivy image scan	Planned
+DAST	OWASP ZAP baseline scan	Planned
+Threat model	STRIDE analysis — design artifact, not an automated stage	Planned
 
-```shell
-java -jar webgoat-2023.8.jar --webgoat.port=8001 --webwolf.port=8002
-```
+Two deliberate scoping decisions:
 
-For a full overview of all the parameters you can use, please check the [WebGoat properties file](webgoat-container/src/main/resources/application-{webgoat, webwolf}.properties).
+SCA uses Trivy rather than OWASP Dependency-Check. Dependency-Check's NVD synchronisation is slow and unreliable without an API key, making it a poor fit for a pipeline that must run predictably.
+DAST is an unauthenticated baseline scan. A full authenticated crawl of WebGoat's lesson tree is out of scope; the baseline scan demonstrates the control and completes in a bounded time.
+Readiness gating, not sleep
 
-## 4. Run from the sources
+The DAST stage gates on WebGoat's actuator health endpoint rather than a fixed delay. If ZAP begins scanning before Spring Boot finishes initialising, it scans connection errors and passes with zero findings — a silent false negative, which is considerably worse than an outright failure.
 
-### Prerequisites:
+Repository layout
+Dockerfile.secure     # hardened multi-stage build (this project)
+Dockerfile            # upstream WebGoat Dockerfile, retained for comparison
+.dockerignore         # rewritten — see note below
+Jenkinsfile           # pipeline definition (in progress)
+jenkins-image/        # Jenkins controller image + pinned plugin set
+docs/                 # threat model and architecture notes
 
-* Java 25
-* Your favorite IDE
-* Git, or Git support in your IDE
+Note on .dockerignore: upstream's excludes the entire source tree and re-includes only the pre-built JAR, which is correct for a build-on-host workflow and silently fatal for a build-in-image one. It reduced the build context to 8 kB and surfaced as ./mvnw: not found — an error three steps removed from its cause. Rewritten here to exclude only target, docs, and CI metadata. .git is retained intentionally, since Maven build-metadata plugins fail without it.
 
-Open a command shell/window:
+Reproducing this locally
 
-```Shell
-git clone git@github.com:WebGoat/WebGoat.git
-```
+Requires a Linux host with Docker, roughly 40 GB free disk, and 8 GB RAM.
 
-Now let's start by compiling the project.
+bash
+# 1. Network and volumes
+docker network create jenkins
+docker volume create jenkins-docker-certs
+docker volume create jenkins-docker-data
+docker volume create jenkins-data
 
-```Shell
-cd WebGoat
-git checkout <<branch_name>>
-# On Linux/Mac:
-./mvnw clean install
+# 2. Privileged dind sidecar — note: no published ports
+docker run --name jenkins-docker --detach \
+  --privileged --restart unless-stopped \
+  --network jenkins --network-alias docker \
+  --env DOCKER_TLS_CERTDIR=/certs \
+  --volume jenkins-docker-certs:/certs/client \
+  --volume jenkins-docker-data:/var/lib/docker \
+  --volume jenkins-data:/var/jenkins_home \
+  docker:dind --storage-driver overlay2
 
-# On Windows:
-./mvnw.cmd clean install
+# 3. Build the controller image
+cd jenkins-image && docker build -t jenkins-secure:local . && cd ..
 
-If you have ran WebGoat before, you should first run mvn clean -Pcleanall to clean up files from your temp and home directories which could fail the tests due to changes in lessons!
+# 4. Run the controller — only 8080 is published
+docker run --name jenkins --detach \
+  --restart unless-stopped \
+  --network jenkins \
+  --env DOCKER_HOST=tcp://docker:2376 \
+  --env DOCKER_CERT_PATH=/certs/client \
+  --env DOCKER_TLS_VERIFY=1 \
+  --publish 8080:8080 \
+  --volume jenkins-data:/var/jenkins_home \
+  --volume jenkins-docker-certs:/certs/client:ro \
+  jenkins-secure:local
 
-# Using docker or podman, you can than build the container locally
-docker build -f Dockerfile . -t webgoat/webgoat
-```
+# 5. Retrieve the initial admin password
+docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
 
-Now we are ready to run the project. WebGoat is using Spring Boot.
+Verify the daemon connection before doing anything else — docker exec jenkins docker version must print both a Client: and a Server: section. The controller runs no daemon of its own, so a Server: block proves the network alias resolved, mutual TLS succeeded, and the API responded.
 
-```Shell
-# On Linux/Mac:
-./mvnw spring-boot:run
-# On Windows:
-./mvnw.cmd spring-boot:run
+Licence and attribution
 
-```
-
-... you should be running WebGoat on http://localhost:8080/WebGoat momentarily.
-
-Note: The above link will redirect you to login page if you are not logged in. LogIn/Create account to proceed.
-
-To change the IP address add the following variable to the `WebGoat/webgoat-container/src/main/resources/application.properties` file:
-
-```
-server.address=x.x.x.x
-```
-
-## 4. Run with custom menu
-
-For specialist only. There is a way to set up WebGoat with a personalized menu. You can leave out some menu categories or individual lessons by setting certain environment variables.
-
-For instance running as a jar on a Linux/macOS it will look like this:
-
-```Shell
-export TZ=Europe/Amsterdam # or your timezone
-export EXCLUDE_CATEGORIES="CLIENT_SIDE,GENERAL,CHALLENGE"
-export EXCLUDE_LESSONS="SqlInjectionAdvanced,SqlInjectionMitigations"
-java -jar target/webgoat-2023.8-SNAPSHOT.jar
-```
-
-Or in a docker run it would (once this version is pushed into docker hub) look like this:
-
-```Shell
-docker run -d -p 127.0.0.1:8080:8080 -p 127.0.0.1:9090:9090 -e EXCLUDE_CATEGORIES="CLIENT_SIDE,GENERAL,CHALLENGE" -e EXCLUDE_LESSONS="SqlInjectionAdvanced,SqlInjectionMitigations" webgoat/webgoat
-```
+OWASP WebGoat is licensed under GPL-2.0 and remains the property of its maintainers. This repository contains pipeline and container configuration built around it.MDEOF
 
