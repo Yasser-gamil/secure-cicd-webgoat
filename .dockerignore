@@ -2,3 +2,5 @@ target
 docs
 .github
 *.md
+Jenkinsfile
+docs
